@@ -12,6 +12,10 @@ Let you pick a new width from the menu (800/1000/1200/1500/2000px)
 
 To undo: python telegram_bubble_patcher.py --restore
 
+<img width="837" height="644" alt="image" src="https://github.com/user-attachments/assets/90719035-b63b-4ee7-b261-2c6bae30eacb" />
+
+
+
 
 **MANUAL METHOD:**
 
