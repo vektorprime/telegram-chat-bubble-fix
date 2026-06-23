@@ -1,4 +1,4 @@
-Instructions:
+**Instructions:**
 
 Run the python script and it will
 
@@ -12,5 +12,7 @@ Let you pick a new width from the menu (800/1000/1200/1500/2000px)
 
 To undo: python telegram_bubble_patcher.py --restore
 
+
+**MANUAL METHOD:**
 
 If you want to learn how to do it manually see my blog post https://techstat.net/telegram-windows-app-expand-chat-bubble-size-fix/
