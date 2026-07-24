@@ -2,9 +2,10 @@
 """
 Telegram Desktop Chat Bubble Width Patcher
 
-Locates the instruction that copies the chat bubble width between settings
-objects ('mov eax,[rbx+9C8]; mov [rsi+9C8],eax') and replaces the source load
-with 'mov eax, <width>; nop' to widen the bubbles. Creates a backup first.
+Widens the chat bubbles by forcing the bubble width at two writers:
+  1. the settings-struct field copy ('mov eax,[rbx+9C8]; mov [rsi+9C8],eax')
+  2. a float->int conversion that stores the width to global RVA 0x8C8F160
+Both are overwritten with the chosen constant width. Creates a backup first.
 
 Usage:
     python telegram_bubble_patcher.py          # Interactive mode
@@ -27,6 +28,27 @@ from pathlib import Path
 LOAD_HEX = "8b83c8090000"        # mov eax, [rbx+9C8]  (patch target, 6 bytes)
 STORE_HEX = "8986c8090000"       # mov [rsi+9C8], eax  (following anchor)
 SEARCH_SIG = LOAD_HEX + STORE_HEX
+
+# Second width writer: a float->int conversion whose result is stored to the
+# global at RVA 0x8C8F160. We replace this 13-byte block:
+#     F2 0F 2C C0      cvttsd2si eax, xmm0   } replaced by 'mov eax,<width>; nop'
+#     85 C0            test eax, eax         }
+#     41 0F 28 C0      movaps xmm0, xmm8     <- kept (feeds the next iteration)
+#     0F 44 C3         cmove eax, ebx        <- dropped (would clobber our value)
+# The trailing mulsd/store are left untouched and act as a re-find anchor.
+CVTT_SIG = "f20f2cc085c0410f28c00f44c3f20f590552afae048905d434aa05"
+CVTT_KEEP = "410f28c0909090"                 # movaps xmm0,xmm8 + 3 nops
+CVTT_SUFFIX = "f20f590552afae048905d434aa05"  # unchanged tail (patched re-find anchor)
+CVTT_PATCH_LEN = 13
+
+KIND_LOAD = 'load'   # 6-byte field-copy load
+KIND_CVTT = 'cvtt'   # 13-byte cvttsd2si block
+
+# Shape of an already-patched site: 'mov eax, <any imm32>; nop'. Matching on the
+# shape (not a specific immediate) lets us re-patch binaries modified by older
+# builds of this tool even if the width encoding changed.
+LOAD_PATCHED_SIG = "b8????????90" + STORE_HEX
+CVTT_PATCHED_SIG = "b8????????90" + CVTT_KEEP + CVTT_SUFFIX
 
 OPTIONS = {
     '1': ('800px',  'B82003000090'),
@@ -102,12 +124,48 @@ def find_all_occurrences(data: bytes, pattern: bytes) -> list:
     return positions
 
 
-def is_valid_patch_site(data: bytes, off: int) -> bool:
-    """A safe patch site is the bubble-width source load 'mov eax,[rbx+9C8]'
-    immediately followed by the store 'mov [rsi+9C8],eax'. The store anchor
-    guards against patching unrelated code if the offset ever goes stale."""
-    store = bytes.fromhex(STORE_HEX)
-    if data[off + 6:off + 12] != store:
+def find_all_wildcard(data: bytes, hex_pattern: str) -> list:
+    """Find all offsets matching hex_pattern, where '??' is a wildcard byte.
+    Anchors on the longest run of fixed bytes for speed."""
+    toks = [hex_pattern[i:i + 2] for i in range(0, len(hex_pattern), 2)]
+    n = len(toks)
+    fixed = [None if t == '??' else int(t, 16) for t in toks]
+
+    best_start, best_len = 0, 0
+    i = 0
+    while i < n:
+        if fixed[i] is not None:
+            j = i
+            while j < n and fixed[j] is not None:
+                j += 1
+            if j - i > best_len:
+                best_start, best_len = i, j - i
+            i = j
+        else:
+            i += 1
+    if best_len == 0:
+        return []
+
+    anchor = bytes(fixed[best_start:best_start + best_len])
+    positions = []
+    start = 0
+    while True:
+        f = data.find(anchor, start)
+        if f == -1:
+            break
+        base = f - best_start
+        if 0 <= base and base + n <= len(data):
+            if all(fixed[k] is None or data[base + k] == fixed[k] for k in range(n)):
+                positions.append(base)
+        start = f + 1
+    return positions
+
+
+def is_valid_load_site(data: bytes, off: int) -> bool:
+    """A safe load patch site is 'mov eax,[rbx+9C8]' immediately followed by the
+    store 'mov [rsi+9C8],eax'. The store anchor guards against patching unrelated
+    code if the offset ever goes stale."""
+    if data[off + 6:off + 12] != bytes.fromhex(STORE_HEX):
         return False
     load = data[off:off + 6]
     if load == bytes.fromhex(LOAD_HEX):
@@ -116,29 +174,51 @@ def is_valid_patch_site(data: bytes, off: int) -> bool:
     return len(load) == 6 and load[0] == 0xB8 and load[5] == 0x90
 
 
-def locate_patch_target(data: bytes):
-    """Find the patch location(s) in the binary. Tries in order:
+def patch_len(kind: str) -> int:
+    return 6 if kind == KIND_LOAD else CVTT_PATCH_LEN
 
-    1. Unpatched writer: 'mov eax,[rbx+9C8]; mov [rsi+9C8],eax'
-    2. Previously-applied patch: 'mov eax,<width>; nop; mov [rsi+9C8],eax'
-    3. Returns (None, None, []) if nothing found
 
-    Positions point at the 6-byte source load that gets replaced.
-    """
-    store = bytes.fromhex(STORE_HEX)
+def make_replacement(kind: str, option_hex: str) -> bytes:
+    if kind == KIND_LOAD:
+        return bytes.fromhex(option_hex)
+    # cvtt: 'mov eax,<width>; nop' + preserved movaps + nops
+    return bytes.fromhex(option_hex + CVTT_KEEP)
 
-    # 1. Unpatched writer signature
-    positions = find_all_occurrences(data, bytes.fromhex(SEARCH_SIG))
-    if positions:
-        return LOAD_HEX, "original", positions
 
-    # 2. Previously-applied replacement (patched load followed by the store)
-    for key, (desc, hex_str) in OPTIONS.items():
-        positions = find_all_occurrences(data, bytes.fromhex(hex_str) + store)
-        if positions:
-            return hex_str, desc, positions
+def detect_current_key(data: bytes, sites: list):
+    """Return the OPTIONS key currently applied, by reading the 'mov eax,imm32'
+    bytes at any patched site, or None if still original."""
+    for off, _kind in sites:
+        b = data[off:off + 6]
+        if len(b) == 6 and b[0] == 0xB8 and b[5] == 0x90:
+            for key, (_desc, hx) in OPTIONS.items():
+                if b == bytes.fromhex(hx):
+                    return key
+    return None
 
-    return None, None, []
+
+def locate_patch_targets(data: bytes):
+    """Find every patch site. Returns (sites, current_key) where sites is a list
+    of (offset, kind). Handles both the unpatched signatures and previously
+    applied patches so the tool can re-patch an already-modified binary."""
+    sites = []
+
+    # Field-copy load sites ('mov eax,[rbx+9C8]; mov [rsi+9C8],eax')
+    load_pos = find_all_occurrences(data, bytes.fromhex(SEARCH_SIG))
+    if load_pos:
+        sites += [(p, KIND_LOAD) for p in load_pos]
+    else:
+        # Already patched: 'mov eax,<imm32>; nop' followed by the store anchor.
+        sites += [(p, KIND_LOAD) for p in find_all_wildcard(data, LOAD_PATCHED_SIG)]
+
+    # cvttsd2si site (global 0x8C8F160)
+    cvtt_pos = find_all_occurrences(data, bytes.fromhex(CVTT_SIG))
+    if cvtt_pos:
+        sites += [(p, KIND_CVTT) for p in cvtt_pos]
+    else:
+        sites += [(p, KIND_CVTT) for p in find_all_wildcard(data, CVTT_PATCHED_SIG)]
+
+    return sites, detect_current_key(data, sites)
 
 
 def restore_backup(exe_path: Path):
@@ -187,17 +267,18 @@ def main():
         print("ERROR: Cannot read the file. Make sure Telegram is not running.")
         sys.exit(1)
 
-    found_hex, found_desc, positions = locate_patch_target(data)
+    sites, current_key = locate_patch_targets(data)
 
-    if positions:
-        if found_desc == "original":
-            print(f"\nOriginal pattern found at {len(positions)} location(s):")
+    if sites:
+        if current_key:
+            print(f"\nFile was previously patched with: {OPTIONS[current_key][0]}")
         else:
-            print(f"\nFile was previously patched with: {found_desc}")
-            print(f"Found at {len(positions)} location(s):")
-
-        for p in positions:
-            print(f"  Offset: 0x{p:X}")
+            print("\nFound unpatched width writer(s):")
+        for off, kind in sites:
+            label = "field +9C8 copy" if kind == KIND_LOAD else "cvttsd2si -> 0x8C8F160"
+            print(f"  Offset: 0x{off:X}  ({label})")
+        if not any(k == KIND_CVTT for _o, k in sites):
+            print("  NOTE: secondary writer (cvttsd2si) not found in this build.")
     else:
         print(f"\nWriter signature '{SEARCH_SIG}' not found.")
         print("No previously-applied patch pattern found either.")
@@ -214,7 +295,7 @@ def main():
         # Safety check: never patch unless the offset really holds the
         # bubble-width load+store pair. Patching anything else corrupts the
         # code and crashes Telegram.
-        if not is_valid_patch_site(data, FALLBACK_OFFSET):
+        if not is_valid_load_site(data, FALLBACK_OFFSET):
             print("\nERROR: The bytes at the fallback offset are NOT the")
             print("bubble-width load+store pair. Patching here would corrupt")
             print("Telegram.exe and crash it. Aborting without changes.")
@@ -228,16 +309,8 @@ def main():
             print("No changes made.")
             return
 
-        positions = [FALLBACK_OFFSET]
-        found_hex = None
-        found_desc = f"unknown (offset 0x{FALLBACK_OFFSET:X})"
-
-    # Determine which option key matches the currently-found patch (if any)
-    current_key = None
-    for key, (desc, hex_str) in OPTIONS.items():
-        if found_hex and found_hex.upper() == hex_str.upper():
-            current_key = key
-            break
+        sites = [(FALLBACK_OFFSET, KIND_LOAD)]
+        current_key = None
 
     # Show menu
     print("\n" + "=" * 40)
@@ -263,7 +336,6 @@ def main():
         sys.exit(1)
 
     desc, hex_str = OPTIONS[choice]
-    replacement = bytes.fromhex(hex_str)
 
     confirm = input(
         f"\nPatch with {desc} width? "
@@ -284,10 +356,12 @@ def main():
         shutil.copy2(exe_path, backup_path)
         print(f"Backup created: {backup_path}")
 
-    # Apply replacements (same length: 6 bytes)
+    # Apply replacements (patch highest offsets first so earlier offsets stay valid)
     new_data = data
-    for pos in reversed(positions):
-        new_data = new_data[:pos] + replacement + new_data[pos + 6:]
+    for off, kind in sorted(sites, key=lambda s: s[0], reverse=True):
+        repl = make_replacement(kind, hex_str)
+        plen = patch_len(kind)
+        new_data = new_data[:off] + repl + new_data[off + plen:]
 
     try:
         with open(exe_path, 'wb') as f:
@@ -296,7 +370,7 @@ def main():
         print("ERROR: Cannot write. Make sure Telegram is NOT running.")
         sys.exit(1)
 
-    print(f"\nDone. Patched {len(positions)} occurrence(s) with {desc} width.")
+    print(f"\nDone. Patched {len(sites)} site(s) with {desc} width.")
     print("Restart Telegram to see the changes.")
 
 
