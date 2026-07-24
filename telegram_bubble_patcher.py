@@ -2,8 +2,9 @@
 """
 Telegram Desktop Chat Bubble Width Patcher
 
-Searches Telegram.exe for a hex pattern and replaces it to change
-the chat bubble width. Creates a backup before patching.
+Locates the instruction that copies the chat bubble width between settings
+objects ('mov eax,[rbx+9C8]; mov [rsi+9C8],eax') and replaces the source load
+with 'mov eax, <width>; nop' to widen the bubbles. Creates a backup first.
 
 Usage:
     python telegram_bubble_patcher.py          # Interactive mode
@@ -17,7 +18,15 @@ import subprocess
 import time
 from pathlib import Path
 
-SEARCH_HEX = "8b05d75e9605"
+# The bubble width is stored in a settings-struct field (offset +0x9C8) and
+# copied between objects with this instruction pair:
+#     8B 83 C8 09 00 00      mov eax, [rbx+9C8]   <- source load (we patch this)
+#     89 86 C8 09 00 00      mov [rsi+9C8], eax   <- destination store (anchor)
+# Replacing the 6-byte load with 'mov eax, <width>; nop' (B8 .. 90) forces the
+# width that gets stored. The store anchor makes the match unambiguous.
+LOAD_HEX = "8b83c8090000"        # mov eax, [rbx+9C8]  (patch target, 6 bytes)
+STORE_HEX = "8986c8090000"       # mov [rsi+9C8], eax  (following anchor)
+SEARCH_SIG = LOAD_HEX + STORE_HEX
 
 OPTIONS = {
     '1': ('800px',  'B82003000090'),
@@ -27,7 +36,9 @@ OPTIONS = {
     '5': ('2000px', 'B8D007000090'),
 }
 
-FALLBACK_OFFSET = 0x2F48BFB
+# Last-known good offset of the load (Telegram Desktop 7.0.5.0). Used only as a
+# last resort and only after the bytes there are validated as a real patch site.
+FALLBACK_OFFSET = 0x2C8DA3A
 PROCESS_NAME = "Telegram.exe"
 
 
@@ -91,21 +102,39 @@ def find_all_occurrences(data: bytes, pattern: bytes) -> list:
     return positions
 
 
+def is_valid_patch_site(data: bytes, off: int) -> bool:
+    """A safe patch site is the bubble-width source load 'mov eax,[rbx+9C8]'
+    immediately followed by the store 'mov [rsi+9C8],eax'. The store anchor
+    guards against patching unrelated code if the offset ever goes stale."""
+    store = bytes.fromhex(STORE_HEX)
+    if data[off + 6:off + 12] != store:
+        return False
+    load = data[off:off + 6]
+    if load == bytes.fromhex(LOAD_HEX):
+        return True
+    # Already patched: 'mov eax, imm32; nop' (B8 .. 90)
+    return len(load) == 6 and load[0] == 0xB8 and load[5] == 0x90
+
+
 def locate_patch_target(data: bytes):
     """Find the patch location(s) in the binary. Tries in order:
 
-    1. Original hex pattern
-    2. Previously-applied replacement patterns
+    1. Unpatched writer: 'mov eax,[rbx+9C8]; mov [rsi+9C8],eax'
+    2. Previously-applied patch: 'mov eax,<width>; nop; mov [rsi+9C8],eax'
     3. Returns (None, None, []) if nothing found
-    """
-    # 1. Try original pattern
-    positions = find_all_occurrences(data, bytes.fromhex(SEARCH_HEX))
-    if positions:
-        return SEARCH_HEX, "original", positions
 
-    # 2. Try each replacement pattern (already patched before)
+    Positions point at the 6-byte source load that gets replaced.
+    """
+    store = bytes.fromhex(STORE_HEX)
+
+    # 1. Unpatched writer signature
+    positions = find_all_occurrences(data, bytes.fromhex(SEARCH_SIG))
+    if positions:
+        return LOAD_HEX, "original", positions
+
+    # 2. Previously-applied replacement (patched load followed by the store)
     for key, (desc, hex_str) in OPTIONS.items():
-        positions = find_all_occurrences(data, bytes.fromhex(hex_str))
+        positions = find_all_occurrences(data, bytes.fromhex(hex_str) + store)
         if positions:
             return hex_str, desc, positions
 
@@ -170,20 +199,30 @@ def main():
         for p in positions:
             print(f"  Offset: 0x{p:X}")
     else:
-        print(f"\nOriginal pattern '{SEARCH_HEX}' not found.")
-        print("Searching for previously-applied patches...")
-        print("No known patch pattern found either.")
+        print(f"\nWriter signature '{SEARCH_SIG}' not found.")
+        print("No previously-applied patch pattern found either.")
 
-        if FALLBACK_OFFSET + 5 >= len(data):
+        if FALLBACK_OFFSET + 12 > len(data):
             print(f"\nERROR: Fallback offset 0x{FALLBACK_OFFSET:X} is out of range.")
             print(f"File size: {len(data)} bytes (0x{len(data):X})")
             sys.exit(1)
 
-        current_bytes = data[FALLBACK_OFFSET:FALLBACK_OFFSET + 6]
+        current_bytes = data[FALLBACK_OFFSET:FALLBACK_OFFSET + 12]
         print(f"\nFalling back to hardcoded file offset: 0x{FALLBACK_OFFSET:X}")
-        print("WARNING: This offset may be incorrect if Telegram was updated.")
         print(f"Current bytes at that offset: {' '.join(f'{b:02X}' for b in current_bytes)}")
 
+        # Safety check: never patch unless the offset really holds the
+        # bubble-width load+store pair. Patching anything else corrupts the
+        # code and crashes Telegram.
+        if not is_valid_patch_site(data, FALLBACK_OFFSET):
+            print("\nERROR: The bytes at the fallback offset are NOT the")
+            print("bubble-width load+store pair. Patching here would corrupt")
+            print("Telegram.exe and crash it. Aborting without changes.")
+            print("\nTelegram was likely updated; the fallback offset is stale.")
+            print("Update SEARCH_SIG / FALLBACK_OFFSET for this version, then retry.")
+            sys.exit(1)
+
+        print("WARNING: This offset may be incorrect if Telegram was updated.")
         proceed = input("\nContinue with this offset anyway? [y/N]: ").strip().lower()
         if proceed != 'y':
             print("No changes made.")
