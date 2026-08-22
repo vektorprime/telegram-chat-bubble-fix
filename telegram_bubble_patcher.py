@@ -286,8 +286,10 @@ def main():
         print("ERROR: Cannot write. Make sure Telegram is NOT running.")
         sys.exit(1)
 
-    print(f"\nDone. Patched {len(offsets)} site(s) with {desc} width.")
-    print("Restart Telegram to see the changes.")
+    print(f"\nSuccess. Patched {len(offsets)} site(s) with {desc} width.")
+    launch = input("Would you like to launch Telegram now? [Y/n]: ").strip().lower()
+    if launch != 'n':
+        os.startfile(str(exe_path))
 
 
 if __name__ == '__main__':
