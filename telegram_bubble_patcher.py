@@ -3,10 +3,10 @@
 Telegram Desktop Chat Bubble Width Patcher
 
 Widens the chat bubbles by forcing the bubble width at the writer that
-computes it: a call whose result is copied to r15d and later stored to the
-width global. The 5-byte call is replaced with 'mov eax, <width>' (B8 ..)
-so the constant flows through the existing 'mov r15d, eax'.
-Creates a backup first.
+stores it to the width global ('mov [rip+disp], eax'). The 6-byte load
+feeding that store ('mov eax, [rbp+disp]') is replaced with
+'mov eax, <width>' (B8 ..) plus a NOP, so the constant flows through the
+existing global store. Creates a backup first.
 
 Usage:
     python telegram_bubble_patcher.py          # Interactive mode
@@ -20,38 +20,40 @@ import subprocess
 import time
 from pathlib import Path
 
-# The bubble width is computed by a call whose result is copied to r15d and
-# later stored to the width global:
-#     E8 ?? ?? ?? ??         call <width getter>  <- replaced by 'mov eax,<width>' (B8 ..)
-#     44 8B F8               mov r15d, eax
+# The bubble width is stored to the width global by 'mov [rip+disp], eax'.
+# The load feeding that store is the patch site:
+#     89 85 ?? ?? ?? ??      mov [rbp+disp], eax       (width saved to stack)
 #     8B D3                  mov edx, ebx
 #     B9 80 02 00 00         mov ecx, 0x280
 #     E8 ?? ?? ?? ??         call
-#     89 85 B0 01 00 00      mov [rbp+1B0], eax
+#     89 85 ?? ?? ?? ??      mov [rbp+disp], eax
 #     8B D3                  mov edx, ebx
 #     B9 20 1C 00 00         mov ecx, 0x1C20
 #     E8 ?? ?? ?? ??         call
 #     8B D8                  mov ebx, eax
-# The fixed bytes between the three calls make the match unambiguous, and the
-# wildcard call offsets keep the search working across Telegram updates.
-SEARCH_SIG = "e8????????448bf88bd3b980020000e8????????8985b00100008bd3b9201c0000e8????????8bd8"
+#     8B 85 ?? ?? ?? ??      mov eax, [rbp+disp]  <- replaced by 'mov eax,<width>'+nop
+#     89 05 ?? ?? ?? ??      mov [rip+disp], eax  <- stores the width to the global
+# The ecx constants and fixed bytes make the match unambiguous; the wildcarded
+# frame/rip displacements and call rel32s keep it working across updates.
+SEARCH_SIG = "8985????????8bd3b980020000e8????????8985????????8bd3b9201c0000e8????????8bd88b85????????8905????????"
 
-# Shape of an already-patched site: first call replaced by
-# 'mov eax, <any imm32>' (B8 ..). Matching on the shape (not a specific
-# immediate) lets us re-patch binaries modified by older builds of this tool
-# even if the width encoding changed.
-PATCHED_SIG = "b8????????448bf88bd3b980020000e8????????8985b00100008bd3b9201c0000e8????????8bd8"
+# Shape of an already-patched site: the load replaced by
+# 'mov eax, <any imm32>' (B8 ..) + nop (90). Matching on the shape (not a
+# specific immediate) lets us re-patch binaries modified by older builds of
+# this tool even if the width encoding changed.
+PATCHED_SIG = "8985????????8bd3b980020000e8????????8985????????8bd3b9201c0000e8????????8bd8b8????????908905????????"
 
-# 'call' (E8 rel32) and 'mov eax,imm32' (B8 imm32) are both 5 bytes, so the
-# patch never changes the code size.
-PATCH_LEN = 5
+# 'mov eax,[rbp+disp32]' (8B 85 .., 6 bytes) is replaced by 'mov eax,imm32'
+# (B8 .., 5 bytes) + 'nop' (90), so the patch never changes the code size.
+PATCH_LEN = 6
+PATCH_OFFSET = 38  # start of the 'mov eax,[rbp+disp]' load inside the match
 
 OPTIONS = {
-    '1': ('800px',  'B820030000'),
-    '2': ('1000px', 'B8E8030000'),
-    '3': ('1200px', 'B8B0040000'),
-    '4': ('1500px', 'B8DC050000'),
-    '5': ('2000px', 'B8D0070000'),
+    '1': ('800px',  'B82003000090'),
+    '2': ('1000px', 'B8E803000090'),
+    '3': ('1200px', 'B8B004000090'),
+    '4': ('1500px', 'B8DC05000090'),
+    '5': ('2000px', 'B8D007000090'),
 }
 
 PROCESS_NAME = "Telegram.exe"
@@ -146,8 +148,8 @@ def detect_current_key(data: bytes, offsets: list):
     """Return the OPTIONS key currently applied, by reading the 'mov eax,imm32'
     bytes at any patched site, or None if still original."""
     for off in offsets:
-        b = data[off:off + 5]
-        if len(b) == 5 and b[0] == 0xB8:
+        b = data[off + PATCH_OFFSET:off + PATCH_OFFSET + PATCH_LEN]
+        if len(b) == PATCH_LEN and b[0] == 0xB8:
             for key, (_desc, hx) in OPTIONS.items():
                 if b == bytes.fromhex(hx):
                     return key
@@ -215,12 +217,12 @@ def main():
     if offsets:
         if current_key:
             print(f"\nFile was previously patched with: {OPTIONS[current_key][0]}")
-        elif any(data[o] == 0xB8 for o in offsets):
+        elif any(data[o + PATCH_OFFSET] == 0xB8 for o in offsets):
             print("\nFile was previously patched with an unrecognized width.")
         else:
             print("\nFound unpatched width writer(s):")
         for off in offsets:
-            print(f"  Offset: 0x{off:X}  (width getter call -> r15d)")
+            print(f"  Offset: 0x{off + PATCH_OFFSET:X}  (width load -> global store)")
     else:
         print("\nWidth-writer signature not found.")
         print("No previously-applied patch pattern found either.")
@@ -272,12 +274,13 @@ def main():
         shutil.copy2(exe_path, backup_path)
         print(f"Backup created: {backup_path}")
 
-    # Apply 'mov eax,<width>' over the call (patch highest offsets first so
+    # Apply 'mov eax,<width>'+nop over the load (patch highest offsets first so
     # earlier offsets stay valid)
     repl = bytes.fromhex(hex_str)
     new_data = data
     for off in sorted(offsets, reverse=True):
-        new_data = new_data[:off] + repl + new_data[off + PATCH_LEN:]
+        site = off + PATCH_OFFSET
+        new_data = new_data[:site] + repl + new_data[site + PATCH_LEN:]
 
     try:
         with open(exe_path, 'wb') as f:
