@@ -172,6 +172,16 @@ def restore_backup(exe_path: Path):
         print(f"No backup found at: {backup}")
         return False
 
+    # A backup taken from an older Telegram can silently downgrade the app.
+    # Refuse when the two differ in size (versions always differ in size).
+    if backup.stat().st_size != exe_path.stat().st_size:
+        print("WARNING: The backup was taken from a different Telegram version.")
+        print(f"  Backup size:   {backup.stat().st_size:,} bytes")
+        print(f"  Installed exe: {exe_path.stat().st_size:,} bytes")
+        print("Restoring it would DOWNGRADE Telegram, not just undo the patch.")
+        print("Delete the .bak file yourself if you really want to restore it.")
+        return False
+
     shutil.copy2(backup, exe_path)
     print(f"Restored original from: {backup}")
     return True
